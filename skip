@@ -1,0 +1,234 @@
+#!/usr/bin/env perl
+
+#
+# Copyright (C) 2014 Paul Z. Kolano <pkolano@gmail.com>.
+# All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the same terms as Perl itself.
+#
+
+use base qw(Net::Server::Multiplex);
+use strict;
+use Crypt::CBC;
+use Crypt::Rijndael;
+use Expect;
+use Getopt::Std;
+use IO::Socket::UNIX;
+use Storable qw(nfreeze thaw);
+use Term::ReadKey;
+
+our $VERSION = 0.10;
+
+my %opts = (
+    d => "$ENV{HOME}/.skip.db",
+    s => "$ENV{HOME}/.skip.sock",
+);
+
+getopts("ad:e:hi:q:r:s:t:x", \%opts) or die "Invalid options\n";
+
+if ($opts{h}) {
+    print "Usage: skip [OPTION]... [COMMAND]\n";
+    print "\n";
+    print "Query and manage keyring entries.\n";
+    print "\n";
+    print "Options (defaults in brackets):\n";
+    print "    -a       start agent\n";
+    print "    -d FILE  use FILE for storing data [~/.skip.db]\n";
+    print "    -e EXPR  run COMMAND and reply to EXPR with secret of -q name\n";
+    print "    -h       help\n";
+    print "    -i NAME  insert secret (prompted) for NAME\n";
+    print "    -q NAME  query stored secret for NAME\n";
+    print "    -r NAME  remove secret for NAME\n";
+    print "    -s FILE  use FILE for socket [~/.skip.sock]\n";
+    print "    -t SECS  abort COMMAND/exit agent after TIME seconds [15/0]\n";
+    print "    -x       direct agent to exit\n";
+    exit;
+}
+
+my $db = {
+    '.' => -1,
+};
+my $db_pw;
+
+die ". is a reserved name\n"
+    if ($opts{i} eq '.' || $opts{q} eq '.' || $opts{r} eq '.');
+
+umask 077;
+
+if ($opts{a}) {
+    my $pw = query_agent("..");
+    die "Agent already running\n" if (defined $pw);
+}
+if ($opts{a} || $opts{i} || $opts{r}) {
+    ReadMode(2);
+    print "Enter db password: ";
+    my $db_pw = ReadLine(0);
+    chomp $db_pw;
+    print "\n";
+    ReadMode(0);
+    $opts{c} = Crypt::CBC->new(
+        -key => $db_pw,
+        -cipher => 'Rijndael',
+    );
+    $db = read_db() if (-e $opts{d});
+    die "Invalid db password\n" if ($db->{'.'} != -1);
+}
+
+if ($opts{a}) {
+    ###############
+    #### AGENT ####
+    ###############
+    $db = undef;
+    $opts{t} = 0 if (!defined $opts{t});
+    # Net::Server needs additional specifier for unix sockets
+    $opts{s} .= "|unix";
+    __PACKAGE__->run(
+        log_level => 0,
+        port => $opts{s},
+        setsid => 1,
+    );
+} elsif ($opts{i}) {
+    ################
+    #### INSERT ####
+    ################
+    ReadMode(2);
+    print "Enter $opts{i} secret: ";
+    my $pw = ReadLine(0);
+    chomp $pw;
+    print "\n";
+    ReadMode(0);
+    $db->{$opts{i}} = $pw;
+    my $dec = nfreeze($db);
+    my $enc = $opts{c}->encrypt_hex($dec);
+    open(FILE, '>', $opts{d});
+    print FILE $enc;
+    close FILE;
+    print "Secret $opts{i} stored\n";
+} elsif ($opts{q}) {
+    ###############
+    #### QUERY ####
+    ###############
+    my $pw = query_agent($opts{q}, 1);
+    if ($opts{e}) {
+        my $exp = Expect->new;
+        $exp->slave->clone_winsize_from(\*STDIN) if (-t);
+        $SIG{WINCH} = sub {
+            my $pid = $exp->pid;
+            $exp->slave->clone_winsize_from(\*STDIN) if (-t);
+            kill WINCH => $exp->pid if ($exp->pid);
+        };
+        $exp->spawn(@ARGV) or die "Cannot spawn command: $!\n";
+        $opts{t} = undef if (!$opts{t});
+        my $match = $exp->expect($opts{t}, $opts{e});
+        if ($match) {
+            $exp->print($pw, "\n");
+            if (-t) {
+                $exp->interact;
+            } else {
+                $exp->expect(undef);
+            }
+        } else {
+            $exp->hard_close;
+            die "Command timed out\n";
+        }
+    } else {
+        print $pw;
+    }
+} elsif ($opts{r}) {
+    ################
+    #### REMOVE ####
+    ################
+    delete $db->{$opts{r}};
+    my $dec = nfreeze($db);
+    my $enc = $opts{c}->encrypt_hex($dec);
+    open(FILE, '>', $opts{d});
+    print FILE $enc;
+    close FILE;
+    print "Secret $opts{r} removed\n";
+}
+
+if ($opts{x}) {
+    ##############
+    #### EXIT ####
+    ##############
+    query_agent(".", 1);
+    if (defined query_agent("..")) {
+        die "Unable to kill agent\n";
+    } else {
+        print "Agent killed\n";
+    }
+}
+
+########################
+#### configure_hook ####
+########################
+sub configure_hook {
+    print "Agent started\n";
+}
+
+###################
+#### mux_input ####
+###################
+sub mux_input {
+    my ($self, $mux, $fh, $data) = @_;
+    $db = read_db();
+    while ($$data =~ s/^(.*?)\r?\n//) {
+        my $name = $1;
+        if ($name eq '.') {
+            $self->server_exit;
+        } elsif ($db->{$name}) {
+            $mux->write($fh, $db->{$name} . "\n");
+        } else {
+            $mux->write($fh, "undef\n");
+        }
+    }
+    $db = undef;
+}
+
+########################
+#### post_bind_hook ####
+########################
+sub post_bind_hook {
+    my $self = shift;
+    if ($opts{t}) {
+        local $SIG{ALRM} = sub {$self->server_exit};
+        alarm $opts{t};
+    }
+}
+
+#####################
+#### query_agent ####
+#####################
+sub query_agent {
+    my $query = shift;
+    my $die = shift;
+    my $sock = IO::Socket::UNIX->new(
+        Peer => $opts{s},
+    );
+    my $pw;
+    if ($sock) {
+        syswrite($sock, "$query\n");
+        $pw = <$sock>;
+        close $sock;
+    } elsif ($die) {
+        die "Cannot connect to agent: $!\n";
+    }
+    return $pw;
+}
+
+#################
+#### read_db ####
+#################
+sub read_db {
+    return undef if (! -e $opts{d});
+    eval {
+        open(FILE, '<', $opts{d});
+        my $enc = <FILE>;
+        close FILE;
+        my $dec = $opts{c}->decrypt_hex($enc);
+        return thaw($dec);
+    }
+}
+
+1;
