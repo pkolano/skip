@@ -3,3 +3,6 @@ CHANGES
 
 * Skip 1.0 (10/15/14)
     - First public release
+
+* Skip 1.1 (06/18/18)
+    - Added -f to pass STDIN to child when using -e

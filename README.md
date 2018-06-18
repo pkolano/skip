@@ -63,6 +63,7 @@ Simple Keyring In Perl (Skip)
             -a       start agent
             -d FILE  use FILE for storing data [~/.skip.db]
             -e EXPR  run COMMAND and reply to EXPR with secret of -q name
+            -f       forward STDIN to COMMAND and send C-d after EXPR match
             -h       help
             -i NAME  insert secret (prompted) for NAME
             -q NAME  query stored secret for NAME

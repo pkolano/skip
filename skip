@@ -18,14 +18,14 @@ use IO::Socket::UNIX;
 use Storable qw(nfreeze thaw);
 use Term::ReadKey;
 
-our $VERSION = 0.10;
+our $VERSION = 0.11;
 
 my %opts = (
     d => "$ENV{HOME}/.skip.db",
     s => "$ENV{HOME}/.skip.sock",
 );
 
-getopts("ad:e:hi:q:r:s:t:x", \%opts) or die "Invalid options\n";
+getopts("ad:fe:hi:q:r:s:t:x", \%opts) or die "Invalid options\n";
 
 if ($opts{h}) {
     print "Usage: skip [OPTION]... [COMMAND]\n";
@@ -35,7 +35,8 @@ if ($opts{h}) {
     print "Options (defaults in brackets):\n";
     print "    -a       start agent\n";
     print "    -d FILE  use FILE for storing data [~/.skip.db]\n";
-    print "    -e EXPR  run COMMAND and reply to EXPR with secret of -q name\n";
+    print "    -e EXPR  run COMMAND and reply to EXPR with secret of -q NAME\n";
+    print "    -f       forward STDIN to COMMAND and send C-d after EXPR match\n";
     print "    -h       help\n";
     print "    -i NAME  insert secret (prompted) for NAME\n";
     print "    -q NAME  query stored secret for NAME\n";
@@ -119,10 +120,14 @@ if ($opts{a}) {
             kill WINCH => $exp->pid if ($exp->pid);
         };
         $exp->spawn(@ARGV) or die "Cannot spawn command: $!\n";
+        if ($opts{f}) {
+            $exp->print($_) while (<STDIN>);
+        }
         $opts{t} = undef if (!$opts{t});
         my $match = $exp->expect($opts{t}, $opts{e});
         if ($match) {
             $exp->print($pw, "\n");
+            $exp->print("\cD") if ($opts{f});
             if (-t) {
                 $exp->interact;
             } else {
